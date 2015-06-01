@@ -1776,12 +1776,12 @@ proc longid {prefix} {
 }
 
 proc readrefs {} {
-    global tagids idtags headids idheads tagobjid
+    global tagids idtags headids idheads tagobjid localrefs_tracking_remotes
     global otherrefids idotherrefs mainhead mainheadid
     global selecthead selectheadid
     global hideremotes
 
-    foreach v {tagids idtags headids idheads otherrefids idotherrefs} {
+    foreach v {tagids idtags headids idheads otherrefids idotherrefs localrefs_tracking_remotes} {
 	unset -nocomplain $v
     }
     set refd [open [list | git show-ref -d] r]
@@ -1832,6 +1832,21 @@ proc readrefs {} {
 	    set selectheadid [exec git rev-parse --verify $selecthead]
 	}
     }
+    #load the local_branch->upstream mapping
+    # the result of the for-each-ref command produces the local_branch NUL upstream
+    set locals_tracking [open [list | git for-each-ref {--format=%(refname:short)%00%(upstream)} refs/heads/] r]
+    while {[gets $locals_tracking local_tracking] >= 0} {
+	set line [split $local_tracking \0]
+	if {[lindex $line 1] ne {}} {
+	    set upstream_ref [string map {"refs/" ""} [lindex $line 1]];
+	    set upstream_exists {}
+	    catch {set upstream_exists [exec git rev-parse --verify $upstream_ref]}
+	    if {$upstream_exists ne ""} {
+		set localrefs_tracking_remotes([lindex $line 0]) $upstream_ref
+	    }
+	}
+    }
+    catch {close $locals_tracking}
 }
 
 # skip over fake commits
@@ -2566,8 +2581,8 @@ proc makewindow {} {
     bind . <Key-Down> "selnextline 1"
     bind . <Shift-Key-Up> "dofind -1 0"
     bind . <Shift-Key-Down> "dofind 1 0"
-    bindkey <Key-Right> "goforw"
-    bindkey <Key-Left> "goback"
+    bindkey <<NextChar>> "goforw"
+    bindkey <<PrevChar>> "goback"
     bind . <Key-Prior> "selnextpage -1"
     bind . <Key-Next> "selnextpage 1"
     bind . <$M1B-Home> "allcanvs yview moveto 0.0"
@@ -10081,43 +10096,70 @@ proc reflistfilter_change {n1 n2 op} {
 }
 
 proc refill_reflist {} {
-    global reflist reflistfilter showrefstop headids tagids otherrefids
+    global reflist reflistfilter showrefstop headids tagids otherrefids localrefs_tracking_remotes sortrefsbytype
     global curview
 
     if {![info exists showrefstop] || ![winfo exists $showrefstop]} return
-    set refs {}
+    set localrefs {}
+    set remoterefs {}
+    set locally_tracked_remote_refs {}
+    set tagrefs {}
+    set otherrefs {}
+
     foreach n [array names headids] {
-	if {[string match $reflistfilter $n]} {
+	if {![string match "remotes/*" $n] && [string match $reflistfilter $n]} {
 	    if {[commitinview $headids($n) $curview]} {
-		if {[string match "remotes/*" $n]} {
-		    lappend refs [list $n R]
-		} else {
-		    lappend refs [list $n H]
+		lappend localrefs [list $n H]
+		if {[info exists localrefs_tracking_remotes($n)]} {
+		    lappend locally_tracked_remote_refs [list $localrefs_tracking_remotes($n) R]
 		}
 	    } else {
 		interestedin $headids($n) {run refill_reflist}
 	    }
 	}
     }
+    set locally_tracked_remote_refs [lsort -index 0 $locally_tracked_remote_refs]
+    set localrefs [lsort -index 0 $localrefs]
+
+    foreach n [array names headids] {
+	if {[string match "remotes/*" $n] && [string match $reflistfilter $n]} {
+	    if {[commitinview $headids($n) $curview]} {
+		if {[lsearch -exact $locally_tracked_remote_refs [list $n H]] < 0} {
+		    lappend remoterefs [list $n R]
+		}
+	    } else {
+		interestedin $headids($n) {run refill_reflist}
+	    }
+	}
+    }
+    set remoterefs [lsort -index 0 $remoterefs]
+
     foreach n [array names tagids] {
 	if {[string match $reflistfilter $n]} {
 	    if {[commitinview $tagids($n) $curview]} {
-		lappend refs [list $n T]
+		lappend tagrefs [list $n T]
 	    } else {
 		interestedin $tagids($n) {run refill_reflist}
 	    }
 	}
     }
+    set tagrefs [lsort -index 0 $tagrefs]
+
     foreach n [array names otherrefids] {
 	if {[string match $reflistfilter $n]} {
 	    if {[commitinview $otherrefids($n) $curview]} {
-		lappend refs [list $n o]
+		lappend otherrefs [list "$n" o]
 	    } else {
 		interestedin $otherrefids($n) {run refill_reflist}
 	    }
 	}
     }
+    set otherrefs [lsort -index 0 $otherrefs]
+    lappend refs {*}$localrefs {*}$locally_tracked_remote_refs {*}$remoterefs {*}$tagrefs {*}$otherrefs
+    if {$sortrefsbytype ne 1} {
     set refs [lsort -index 0 $refs]
+    }
+
     if {$refs eq $reflist} return
 
     # Update the contents of $showrefstop.list according to the
@@ -11530,7 +11572,7 @@ proc create_prefs_page {w} {
 proc prefspage_general {notebook} {
     global NS maxwidth maxgraphpct showneartags showlocalchanges
     global tabstop limitdiffs autoselect autosellen extdifftool perfile_attrs
-    global hideremotes want_ttk have_ttk maxrefs web_browser
+    global hideremotes want_ttk have_ttk maxrefs web_browser sortrefsbytype
 
     set page [create_prefs_page $notebook.general]
 
@@ -11554,6 +11596,9 @@ proc prefspage_general {notebook} {
     ${NS}::checkbutton $page.hideremotes -text [mc "Hide remote refs"] \
 	-variable hideremotes
     grid x $page.hideremotes -sticky w
+    ${NS}::checkbutton $page.sortrefsbytype -text [mc "Sort refs by type"] \
+	-variable sortrefsbytype
+    grid x $page.sortrefsbytype -sticky w
 
     ${NS}::label $page.ddisp -text [mc "Diff display options"]
     grid $page.ddisp - -sticky w -pady 10
@@ -11665,7 +11710,7 @@ proc doprefs {} {
     global oldprefs prefstop showneartags showlocalchanges
     global uicolor bgcolor fgcolor ctext diffcolors selectbgcolor markbgcolor
     global tabstop limitdiffs autoselect autosellen extdifftool perfile_attrs
-    global hideremotes want_ttk have_ttk
+    global hideremotes want_ttk have_ttk sortrefsbytype
 
     set top .gitkprefs
     set prefstop $top
@@ -11674,7 +11719,8 @@ proc doprefs {} {
 	return
     }
     foreach v {maxwidth maxgraphpct showneartags showlocalchanges \
-		   limitdiffs tabstop perfile_attrs hideremotes want_ttk} {
+		   limitdiffs tabstop perfile_attrs hideremotes want_ttk \
+		   sortrefsbytype} {
 	set oldprefs($v) [set $v]
     }
     ttk_toplevel $top
@@ -11800,7 +11846,8 @@ proc prefscan {} {
     global oldprefs prefstop
 
     foreach v {maxwidth maxgraphpct showneartags showlocalchanges \
-		   limitdiffs tabstop perfile_attrs hideremotes want_ttk} {
+		   limitdiffs tabstop perfile_attrs hideremotes want_ttk \
+		   sortrefsbytype} {
 	global $v
 	set $v $oldprefs($v)
     }
@@ -12259,11 +12306,13 @@ if {[catch {package require Tk 8.4} err]} {
 
 # on OSX bring the current Wish process window to front
 if {[tk windowingsystem] eq "aqua"} {
+    catch {
     exec osascript -e [format {
         tell application "System Events"
             set frontmost of processes whose unix id is %d to true
         end tell
     } [pid] ]
+    }
 }
 
 # Unset GIT_TRACE var if set
@@ -12336,6 +12385,7 @@ set showneartags 1
 set hideremotes 0
 set maxrefs 20
 set visiblerefs {"master"}
+set sortrefsbytype 0
 set maxlinelen 200
 set showlocalchanges 1
 set limitdiffs 1
@@ -12445,7 +12495,7 @@ set config_variables {
     filesepbgcolor filesepfgcolor linehoverbgcolor linehoverfgcolor
     linehoveroutlinecolor mainheadcirclecolor workingfilescirclecolor
     indexcirclecolor circlecolors linkfgcolor circleoutlinecolor
-    web_browser
+    web_browser sortrefsbytype
 }
 foreach var $config_variables {
     config_init_trace $var
